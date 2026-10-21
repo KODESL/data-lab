@@ -1,0 +1,96 @@
+# Local lab. `docker compose up` gives you, with no cloud account and no network:
+#   JupyterLab  http://localhost:8888   (notebooks + src mounted live)
+#   API docs    http://localhost:8000/docs
+#   MLflow      http://localhost:5000
+#   MinIO       http://localhost:9001   (user/pass: madrid / madridmadrid)
+#   Postgres    localhost:5432          (madrid / madrid, db madrid)
+# The `seed` service runs the whole pipeline once on mock data, then exits.
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  volumes:
+    - ./:/work
+    - lake:/work/data/lake
+  env_file: .env
+  environment:
+    MADRID_LAKE_ROOT: /work/data/lake
+    MADRID_DATABASE_URL: postgresql://madrid:madrid@db:5432/madrid
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: madrid
+      POSTGRES_PASSWORD: madrid
+      POSTGRES_DB: madrid
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U madrid"]
+      interval: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: madrid
+      MINIO_ROOT_PASSWORD: madridmadrid
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 madrid madridmadrid; do sleep 1; done;
+      mc mb -p local/bronze local/silver local/gold local/mlflow; exit 0"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.1
+    depends_on:
+      db: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://madrid:madrid@db:5432/madrid
+      --artifacts-destination s3://mlflow/
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: madrid
+      AWS_SECRET_ACCESS_KEY: madridmadrid
+    ports: ["5000:5000"]
+
+  seed:
+    <<: *app
+    depends_on:
+      db: { condition: service_healthy }
+    command: madrid run-all
+
+  api:
+    <<: *app
+    depends_on:
+      seed: { condition: service_completed_successfully }
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports: ["8000:8000"]
+
+  lab:
+    <<: *app
+    build:
+      context: .
+      target: lab
+    depends_on:
+      seed: { condition: service_completed_successfully }
+    ports: ["8888:8888"]
+
+volumes:
+  pgdata:
+  minio:
+  lake:
